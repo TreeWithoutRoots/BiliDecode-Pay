@@ -50,6 +50,7 @@ REQUEST_TIMEOUT = 10          # 秒
 REQUEST_INTERVAL = 0.5        # 请求间隔（秒）
 MAX_RETRIES = 2               # API 调用失败重试次数
 RETRY_DELAY = 3               # 重试间隔（秒）
+MODEL_TIMEOUT = 120           # 模型调用超时（秒）
 
 # ─── 数据采集参数 ───
 HOT_COMMENT_LIMIT = 20        # 热评数量
@@ -82,3 +83,6 @@ GOOGLE_FONTS_URL = (
     "https://fonts.googleapis.com/css2?"
     "family=Press+Start+2P&family=VT323&family=Silkscreen:wght@400;700&display=swap"
 )
+
+# ─── Waffo Pancake 支付 ───
+WAFFO_API_BASE = "https://api.waffo.ai"

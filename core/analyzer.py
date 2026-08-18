@@ -4,6 +4,7 @@ import time
 import os
 from dataclasses import dataclass
 
+import httpx
 from openai import OpenAI
 
 from config import (
@@ -11,6 +12,7 @@ from config import (
     BAILIAN_MODELS,
     MAX_RETRIES,
     RETRY_DELAY,
+    MODEL_TIMEOUT,
 )
 from core.bilibili_client import VideoData
 from core.prompts import build_prompt
@@ -28,10 +30,13 @@ class AnalysisResult:
 
 
 def _create_client(api_key: str) -> OpenAI:
-    """创建 OpenAI 兼容客户端"""
+    """创建 OpenAI 兼容客户端，绕过代理直连百炼 API"""
+    _http = httpx.Client(trust_env=False)
     return OpenAI(
         api_key=api_key,
         base_url=BAILIAN_API_BASE_URL,
+        timeout=MODEL_TIMEOUT,
+        http_client=_http,
     )
 
 

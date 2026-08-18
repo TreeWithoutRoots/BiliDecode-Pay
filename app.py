@@ -14,7 +14,10 @@ load_dotenv()
 
 # ─── Streamlit Cloud Secrets 兼容 ───
 # 本地用 .env，云端用 st.secrets，这里统一加载到环境变量
-for _key in ("DASHSCOPE_API_KEY", "SUPABASE_URL", "SUPABASE_SECRET_KEY"):
+for _key in ("DASHSCOPE_API_KEY", "SUPABASE_URL", "SUPABASE_SECRET_KEY",
+             "WAFFO_MERCHANT_ID", "WAFFO_STORE_SLUG", "WAFFO_PRIVATE_KEY",
+             "WAFFO_PRODUCT_ID", "WAFFO_SUCCESS_URL", "WAFFO_ENVIRONMENT",
+             "WAFFO_CURRENCY"):
     if _key not in os.environ:
         try:
             os.environ[_key] = st.secrets[_key]
@@ -33,6 +36,7 @@ from core.supabase_client import (
     get_report_by_id as sb_report,
     get_stats as sb_stats,
 )
+from core.waffo_client import WaffoClient
 from ui.style import inject_y2k_style, render_header
 from ui.components import (
     pixel_status, pixel_progress, render_cost_box, render_cover_preview,
@@ -51,6 +55,26 @@ st.set_page_config(
 inject_y2k_style()
 render_header()
 
+# ─── Waffo 支付初始化 ───
+waffo = WaffoClient()
+
+# 检测支付回调（用户从 Waffo 结账页面返回）
+if "session_id" in st.query_params:
+    _session_id = st.query_params.get("session_id", "")
+    _paid_bvid = st.query_params.get("bvid", "")
+    _paid_model = st.query_params.get("model", DEFAULT_MODEL)
+
+    _verified = waffo.verify_payment(_session_id)
+
+    if _verified:
+        st.session_state["paid_bvid"] = _paid_bvid
+        st.session_state["paid_model"] = _paid_model
+        st.session_state["auto_analyze"] = True
+    else:
+        st.session_state["payment_error"] = "支付验证失败，请重新支付"
+    st.query_params.clear()
+    st.rerun()
+
 
 # ─── 侧边栏：系统状态 ───
 with st.sidebar:
@@ -67,6 +91,18 @@ with st.sidebar:
         f"<div style='font-family: VT323, monospace; font-size: 18px; "
         f"color: {Y2K_COLORS['accent_primary']};'>"
         f"{sb_icon} {sb_text}"
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+    # Waffo 支付状态
+    waffo_ok = waffo.is_configured()
+    waffo_icon = "✅" if waffo_ok else "⬜"
+    waffo_text = "Waffo 支付已启用" if waffo_ok else "Waffo 支付未配置"
+    st.markdown(
+        f"<div style='font-family: VT323, monospace; font-size: 18px; "
+        f"color: {Y2K_COLORS['accent_primary']};'>"
+        f"{waffo_icon} {waffo_text}"
         f"</div>",
         unsafe_allow_html=True,
     )
@@ -96,6 +132,10 @@ tab_analyze, tab_history, tab_dashboard = st.tabs(
 #  Tab 1: 分析
 # ═══════════════════════════════════════════
 with tab_analyze:
+    _pay_err = st.session_state.pop("payment_error", None)
+    if _pay_err:
+        pixel_status(f"ERROR: {_pay_err}", "error")
+
     st.markdown("### INPUT VIDEO URL")
 
     col1, col2 = st.columns([3, 1])
@@ -120,7 +160,8 @@ with tab_analyze:
             key for key, label in model_options.items() if label == selected_model_label
         )
 
-    analyze_btn = st.button("START ANALYSIS", use_container_width=True)
+    _btn_label = "PAY & ANALYZE" if waffo.is_configured() else "START ANALYSIS"
+    analyze_btn = st.button(_btn_label, use_container_width=True)
 
 
     # ─── 报告拆分 ───
@@ -151,6 +192,14 @@ with tab_analyze:
 
 
     # ─── 分析逻辑 ───
+    should_analyze = False
+
+    # 支付回调：自动开始分析
+    if st.session_state.pop("auto_analyze", False):
+        bvid = st.session_state.pop("paid_bvid", "")
+        selected_model = st.session_state.pop("paid_model", DEFAULT_MODEL)
+        should_analyze = True
+
     if analyze_btn:
         if not os.getenv("DASHSCOPE_API_KEY"):
             pixel_status("ERROR: 服务端未配置 API Key，请联系管理员", "error")
@@ -165,40 +214,86 @@ with tab_analyze:
             pixel_status("ERROR: 无法解析BV号，请检查链接是否正确", "error")
             st.stop()
 
-        pixel_status(f"BVID: {bvid}  MODEL: {selected_model}", "info")
-
-        with st.status("分析进行中...", expanded=True) as status:
-            st.write("📡 采集视频元数据...")
-            pixel_progress("FETCHING DATA", 15)
-
-            video_data = fetch_video_data(bvid)
-
-            if not video_data.title:
-                status.update(label="采集失败", state="error")
-                pixel_status(
-                    f"ERROR: {video_data.errors[0] if video_data.errors else '视频数据采集失败'}",
-                    "error",
+        # Waffo 支付流程：创建结账会话并跳转
+        if waffo.is_configured():
+            import streamlit.components.v1 as components
+            _success_url = (
+                f"{waffo.success_url}"
+                f"?session_id={{SESSION_ID}}&bvid={bvid}&model={selected_model}"
+            )
+            with st.spinner("正在创建支付订单..."):
+                _session = waffo.create_checkout_session(success_url=_success_url)
+            if _session and _session.get("checkoutUrl"):
+                _checkout_url = _session["checkoutUrl"]
+                st.markdown(
+                    f"<div style='text-align:center; padding:20px;'>"
+                    f"<p style='font-family: Press Start 2P, cursive; font-size: 12px; "
+                    f"color: {Y2K_COLORS['accent_primary']}; letter-spacing: 1px; "
+                    f"margin-bottom: 16px;'>PAYMENT READY</p>"
+                    f"<p style='font-family: VT323, monospace; font-size: 20px; "
+                    f"color: {Y2K_COLORS['text_main']};'>"
+                    f"支付订单已创建，请点击下方按钮完成支付</p></div>",
+                    unsafe_allow_html=True,
+                )
+                st.link_button(
+                    "💳 前往支付页面",
+                    _checkout_url,
+                    use_container_width=True,
                 )
                 st.stop()
-
-            st.write(f"✅ 视频标题：{video_data.title}")
-            pixel_progress("DATA FETCHED", 30)
-
-            st.write("💬 采集热门评论与弹幕...")
-            pixel_progress("FETCHING COMMENTS", 50)
-
-            st.write(f"🤖 调用 {selected_model} 分析中...")
-            pixel_progress("AI ANALYSIS", 70)
-
-            result = analyze_video_metadata(video_data, model=selected_model)
-
-            if result.error:
-                status.update(label="分析失败", state="error")
-                pixel_status(f"ERROR: {result.error}", "error")
+            else:
+                pixel_status("ERROR: 创建支付订单失败，请稍后重试", "error")
                 st.stop()
 
-            pixel_progress("ANALYSIS COMPLETE", 100)
-            status.update(label="分析完成!", state="complete")
+        should_analyze = True
+
+    if should_analyze or st.session_state.get("last_result"):
+        if should_analyze:
+            pixel_status(f"BVID: {bvid}  MODEL: {selected_model}", "info")
+
+            with st.status("分析进行中...", expanded=True) as status:
+                st.write("📡 采集视频元数据...")
+                pixel_progress("FETCHING DATA", 15)
+
+                video_data = fetch_video_data(bvid)
+
+                if not video_data.title:
+                    status.update(label="采集失败", state="error")
+                    pixel_status(
+                        f"ERROR: {video_data.errors[0] if video_data.errors else '视频数据采集失败'}",
+                        "error",
+                    )
+                    st.stop()
+
+                st.write(f"✅ 视频标题：{video_data.title}")
+                pixel_progress("DATA FETCHED", 30)
+
+                st.write("💬 采集热门评论与弹幕...")
+                pixel_progress("FETCHING COMMENTS", 50)
+
+                st.write(f"🤖 调用 {selected_model} 分析中...")
+                pixel_progress("AI ANALYSIS", 70)
+
+                result = analyze_video_metadata(video_data, model=selected_model)
+
+                if result.error:
+                    status.update(label="分析失败", state="error")
+                    pixel_status(f"ERROR: {result.error}", "error")
+                    st.stop()
+
+                pixel_progress("ANALYSIS COMPLETE", 100)
+                status.update(label="分析完成!", state="complete")
+
+            st.session_state["last_video_data"] = video_data
+            st.session_state["last_result"] = result
+            st.session_state["last_url"] = url_input.strip()
+
+            if sb_configured():
+                saved = sb_save(video_data, result, video_url=url_input.strip())
+                st.session_state["last_save_status"] = "saved" if saved else "failed"
+        else:
+            video_data = st.session_state["last_video_data"]
+            result = st.session_state["last_result"]
 
         # ─── 展示结果 ───
         st.markdown("---")
@@ -258,50 +353,44 @@ with tab_analyze:
                 use_container_width=True,
             )
 
-        # ─── 保存到 Supabase ───
-        if sb_configured():
-            saved = sb_save(video_data, result, video_url=url_input.strip())
-            if saved:
-                st.markdown(
-                    f"<div style='font-family: VT323, monospace; font-size: 18px; "
-                    f"color: {Y2K_COLORS['success']}; "
-                    f"border-left: 3px solid {Y2K_COLORS['success']}; "
-                    f"padding-left: 12px; margin-top: 8px;'>"
-                    f"✅ 分析记录已保存到 Supabase"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
-            else:
-                st.markdown(
-                    f"<div style='font-family: VT323, monospace; font-size: 18px; "
-                    f"color: {Y2K_COLORS['error']}; "
-                    f"border-left: 3px solid {Y2K_COLORS['error']}; "
-                    f"padding-left: 12px; margin-top: 8px;'>"
-                    f"⚠ Supabase 保存失败，不影响本次分析结果"
-                    f"</div>",
-                    unsafe_allow_html=True,
-                )
+        # ─── Supabase 保存状态 ───
+        _save_status = st.session_state.get("last_save_status")
+        if _save_status == "saved":
+            st.markdown(
+                f"<div style='font-family: VT323, monospace; font-size: 18px; "
+                f"color: {Y2K_COLORS['success']}; "
+                f"border-left: 3px solid {Y2K_COLORS['success']}; "
+                f"padding-left: 12px; margin-top: 8px;'>"
+                f"✅ 分析记录已保存到 Supabase"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
+        elif _save_status == "failed":
+            st.markdown(
+                f"<div style='font-family: VT323, monospace; font-size: 18px; "
+                f"color: {Y2K_COLORS['error']}; "
+                f"border-left: 3px solid {Y2K_COLORS['error']}; "
+                f"padding-left: 12px; margin-top: 8px;'>"
+                f"⚠ Supabase 保存失败，不影响本次分析结果"
+                f"</div>",
+                unsafe_allow_html=True,
+            )
 
-    elif not analyze_btn:
+    elif not should_analyze:
+        _btn_label = 'PAY & ANALYZE' if waffo.is_configured() else 'START ANALYSIS'
+        _pay_note = f"<span style='color: {Y2K_COLORS['accent_secondary']};'>💳 本次分析需要通过 Waffo 支付后进行。</span><br>" if waffo.is_configured() else ""
         st.markdown(
             f"""
-            <div style='font-family: VT323, monospace; font-size: 19px; "
-            f"color: {Y2K_COLORS['text_main']}; "
-            f"border: 2px solid {Y2K_COLORS['border']}; "
-            f"border-left: 4px solid {Y2K_COLORS['accent_primary']}; "
-            f"background: {Y2K_COLORS['bg_card']}; "
-            f"padding: 20px 24px; margin-top: 12px; "
-            f"line-height: 1.8;'>
-            <span style='font-family: Press Start 2P, cursive; font-size: 11px; "
-            f"color: {Y2K_COLORS['accent_secondary']}; display: block; "
-            f"margin-bottom: 12px; letter-spacing: 1px;'>READY</span>
-            📺 在上方输入B站视频链接，选择模型后点击 START ANALYSIS 开始分析。<br>
+            <div style="font-family: VT323, monospace; font-size: 19px; color: {Y2K_COLORS['accent_primary']}; border: 2px solid {Y2K_COLORS['border']}; border-left: 4px solid {Y2K_COLORS['accent_primary']}; background: {Y2K_COLORS['bg_card']}; padding: 20px 24px; margin-top: 12px; line-height: 1.8;">
+            <span style="font-family: Press Start 2P, cursive; font-size: 11px; color: {Y2K_COLORS['accent_secondary']}; display: block; margin-bottom: 12px; letter-spacing: 1px;">READY</span>
+            📺 在上方输入B站视频链接，选择模型后点击 {_btn_label} 开始分析。<br>
             系统将采集视频公开元数据（标题、统计、评论、弹幕、封面等），<br>
-            调用阿里百炼多模态大模型生成六维度结构化分析报告。<br><br>
-            <span style='color: {Y2K_COLORS['accent_primary']};'>支持的链接格式：</span><br>
-            <span style='color: {Y2K_COLORS['text_dim']};'>• https://www.bilibili.com/video/BVxxxxxxxx</span><br>
-            <span style='color: {Y2K_COLORS['text_dim']};'>• https://b23.tv/xxxxxxx</span><br>
-            <span style='color: {Y2K_COLORS['text_dim']};'>• https://m.bilibili.com/video/BVxxxxxxxx</span>
+            调用阿里百炼多模态大模型生成六维度结构化分析报告。<br>
+            {_pay_note}<br>
+            <span style="color: {Y2K_COLORS['accent_primary']};">支持的链接格式：</span><br>
+            <span style="color: {Y2K_COLORS['accent_secondary']};">• https://www.bilibili.com/video/BVxxxxxxxx</span><br>
+            <span style="color: {Y2K_COLORS['accent_secondary']};">• https://b23.tv/xxxxxxx</span><br>
+            <span style="color: {Y2K_COLORS['accent_secondary']};">• https://m.bilibili.com/video/BVxxxxxxxx</span>
             </div>
             """,
             unsafe_allow_html=True,

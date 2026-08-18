@@ -25,6 +25,12 @@ class Comment:
     reply_count: int = 0
 
 
+# 创建不使用代理的 session（B站 API 直连，绕过代理）
+_session = requests.Session()
+_session.trust_env = False
+_session.headers.update(BILIBILI_HEADERS)
+
+
 @dataclass
 class VideoData:
     bvid: str = ""
@@ -58,10 +64,9 @@ def _request(url: str, params: dict = None) -> dict | None:
     """发起 GET 请求，带重试。返回 JSON dict 或 None。"""
     for attempt in range(MAX_RETRIES + 1):
         try:
-            resp = requests.get(
+            resp = _session.get(
                 url,
                 params=params,
-                headers=BILIBILI_HEADERS,
                 timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
@@ -82,9 +87,8 @@ def _request_raw(url: str) -> str | None:
     """发起 GET 请求，返回原始文本（用于弹幕 XML）。"""
     for attempt in range(MAX_RETRIES + 1):
         try:
-            resp = requests.get(
+            resp = _session.get(
                 url,
-                headers=BILIBILI_HEADERS,
                 timeout=REQUEST_TIMEOUT,
             )
             resp.raise_for_status()
